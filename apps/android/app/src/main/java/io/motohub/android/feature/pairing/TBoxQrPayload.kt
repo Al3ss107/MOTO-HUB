@@ -258,19 +258,39 @@ object TBoxQrParser {
 
         // A dash that wants the phone to host carries no network of its own to name, so this code
         // is complete without an SSID and rejecting it for the missing field would be wrong. The
-        // rider still has to type the credentials the dash prints on its own screen (Android does
-        // not let an app dictate them), but the profile, the transport and the MAC all come from
-        // here instead of from a guess.
+        // profile, the transport and the MAC all come from here instead of from a guess.
+        //
+        // Which of the two roads it takes cannot be read off the code, because both families print
+        // the same one. Some of these dashes dictate an SSID and password on their own screen for
+        // the rider to type into Android's tethering settings; others print nothing at all and hand
+        // the credentials over on Bluetooth instead (EC-BTP build-net, `EcBtpNetLink`). A dash
+        // photographed on 2026-09-06 sat inside its own WIFI CONNECTION page showing neither, which
+        // is the shape the old mapping had no answer for: it sent the rider to a form to type
+        // credentials that do not exist anywhere, and saved no profile at all, so the Bluetooth road
+        // could never be reached.
+        //
+        // So the code now picks the road that needs nothing from the rider, and
+        // [io.motohub.android.tbox.TBoxLinkResolver] falls back to the hosted network when no dash
+        // answers the scan - the mirror of the fallback that already ran the other way round. Either
+        // family connects; the choice here only decides which road is tried first.
         if (ssid.isEmpty() && topology.phoneHostsHotspot && dashMac != null) {
             val tail = dashMac.filter { it != ':' }.takeLast(6).uppercase()
+            // A profile is keyed by SSID and this dash has none, so it is keyed the way the opaque
+            // CARBIT token keys one: `EC` and the MAC's last four bytes. Nothing addresses the radio
+            // with it - EcBtpNetLink finds the dash by the service it advertises - it only has to be
+            // stable and unique, so a second bike in the garage does not collide on a blank SSID.
+            // Unlike the CARBIT token's dashes this one does not answer to that name in a Bluetooth
+            // scanner (the dash photographed on 2026-09-06 advertises `KY05E381`), which is why what
+            // the rider is shown is the display name below and never this key.
+            val dashName = "EC" + dashMac.filter { it != ':' }.takeLast(8).uppercase()
             return TBoxQrPayload(
-                ssid = "",
+                ssid = dashName,
                 password = "",
                 encryption = null,
                 modelId = parameters["modelid"],
                 displayName = "Phone hotspot ($tail)",
                 origin = origin,
-                suggestedConnectionMode = TBoxConnectionMode.PHONE_HOTSPOT,
+                suggestedConnectionMode = TBoxConnectionMode.BLE_PROVISIONED,
                 topology = topology,
                 dashMacAddress = dashMac
             )

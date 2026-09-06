@@ -261,14 +261,32 @@ class TBoxQrParserTest {
                 "?modelid=21322&sn=t6J4&action=128&bm=DD%3A0D%3A30%3A24%3A87%3A6D"
         ).getOrThrow()
 
-        assertEquals("", payload.ssid)
         assertEquals("", payload.password)
         assertEquals("21322", payload.modelId)
         assertEquals("dd:0d:30:24:87:6d", payload.dashMacAddress)
-        assertEquals(TBoxConnectionMode.PHONE_HOTSPOT, payload.suggestedConnectionMode)
         assertTrue(payload.topology.phoneHostsHotspot)
         assertFalse(payload.topology.accessPoint)
         assertFalse(payload.topology.wifiDirect)
+    }
+
+    @Test
+    fun aCodeThatNamesNoNetworkIsSetUpOverBluetoothFirst() {
+        // Photographed on a dash sitting inside its own WIFI CONNECTION page on 2026-09-06: no
+        // SSID, no password, nothing for the rider to type. The road that needs nothing from them
+        // is the Bluetooth one, and TBoxLinkResolver still falls back to the hosted network for the
+        // dashes of this shape that DO print credentials.
+        val payload = TBoxQrParser.parse(
+            "http://www.carbit.com.cn/down6/645/644/_ylqxos" +
+                "?modelid=21322&sn=MgYD&action=128&bm=DD%3A0D%3A30%3A05%3AE3%3A81"
+        ).getOrThrow()
+
+        assertEquals(TBoxConnectionMode.BLE_PROVISIONED, payload.suggestedConnectionMode)
+        // Keyed and named the way the opaque CARBIT token names one, so the profile survives being
+        // saved beside another bike instead of colliding on a blank SSID.
+        assertEquals("EC3005E381", payload.ssid)
+        assertEquals("Phone hotspot (05E381)", payload.displayName)
+        assertEquals("dd:0d:30:05:e3:81", payload.dashMacAddress)
+        assertEquals(TBoxQrOrigin.RECOGNISED, payload.origin)
     }
 
     @Test

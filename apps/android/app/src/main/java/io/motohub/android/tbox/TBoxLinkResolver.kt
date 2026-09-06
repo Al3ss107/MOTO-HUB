@@ -42,7 +42,20 @@ object TBoxLinkResolver {
         formedGroup: FormedP2pGroup? = null
     ): Result<TBoxLink> =
         if (profile.connectionMode == TBoxConnectionMode.BLE_PROVISIONED) {
-            bluetoothProvisionedLink(context)
+            bluetoothProvisionedLink(context).recoverCatching { bluetoothFailure ->
+                // No dash answered the scan. The mirror of the PHONE_HOTSPOT fallback below, and it
+                // exists for the same reason: a Carbit code that names no network reaches both the
+                // dashes that hand their credentials over on Bluetooth and the dashes that print an
+                // SSID and password for the rider to type, and nothing in the code tells them apart
+                // (see TBoxQrPayload.parseProvisioningUrl). Sending the second kind down the
+                // Bluetooth road and stopping there would have cost them a working pairing, so when
+                // the radio finds nothing the network the rider hosts is tried after all.
+                //
+                // Only ever a second chance: a profile the rider set to this mode by hand, on a
+                // phone with no hotspot up, still ends on the Bluetooth failure - hostedLink fails
+                // too, and its message is the one that names the missing hotspot.
+                hostedLink(context).getOrElse { throw bluetoothFailure }
+            }
         } else if (profile.connectionMode == TBoxConnectionMode.PHONE_HOTSPOT) {
             hostedLink(context).recoverCatching { hostedFailure ->
                 // Nothing is hosted. Before telling the rider to turn a hotspot on - which some
