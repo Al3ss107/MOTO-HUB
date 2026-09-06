@@ -254,9 +254,10 @@ object TBoxLinkResolver {
      * same log and the same minute, an AUTO-mode profile joined the same dash's AP, resolved it
      * over NSD and reached READY.
      *
-     * Deliberately narrow. It runs only when the scan actually SAW the dash: an unknown answer
-     * leaves the original hotspot message standing, because "turn your hotspot on" is the right
-     * advice for the rider whose dash really is a Wi-Fi client.
+     * Deliberately narrow. It runs only on evidence that this dash HAS an access point - a
+     * network still held for its SSID, or a scan that actually saw it. An unknown answer leaves
+     * the original hotspot message standing, because "turn your hotspot on" is the right advice
+     * for the rider whose dash really is a Wi-Fi client. See [accessPointEvidence].
      *
      * It used to stop there, on the rule that a mode the rider chose is theirs to keep. That rule
      * cost field log 6662-E47B-06D0 three weeks: a CFMOTO 800MT-X saved as PHONE_HOTSPOT on
@@ -274,8 +275,27 @@ object TBoxLinkResolver {
         profile: MotorcycleProfile,
         hostedFailure: Throwable
     ): Result<TBoxLink> {
-        val broadcasting = networkConnector.isDashBroadcasting(profile)
-        if (broadcasting != true) {
+        // The scan is not the only evidence, and it is not the best one. A network this connector
+        // is STILL HOLDING for this very SSID is the dash's access point, joined and measurable,
+        // and no scan throttle can withdraw it - so it is asked first and the scan is not asked
+        // at all when it answers.
+        //
+        // Rider 6e77dcf7 (samsung SM-S948B, CFMOTO6627, 2026-09-06) is what this costs. Seven
+        // times in three minutes - 11:00:58, 11:00:59, 11:01:00, 11:03:04, 11:03:11, 11:03:12,
+        // 11:03:15 - this road was declined with "no usable scan at all" while network 266 for
+        // CFMOTO6627 was held, process-bound, and had measured -41dBm on 5180MHz 840ms earlier
+        // through this same connector. `getScanResults` returned zero networks each time: Android
+        // throttles it hard, and the rider had switched modes ten times in twelve minutes. In the
+        // same window the fallback WON three times - 11:00:44, 11:01:05, 11:01:09 - each time by
+        // reusing that identical network in milliseconds. Same state, opposite outcome, decided
+        // by nothing but whether a throttled list happened to be non-empty on that call.
+        //
+        // 98 occurrences of the resulting "turn your hotspot on" in one report, the most of any
+        // installation that has ever logged it.
+        val holdsNetwork = networkConnector.isHuntingFor(profile.ssid) &&
+            networkConnector.currentNetwork() != null
+        val broadcasting = if (holdsNetwork) null else networkConnector.isDashBroadcasting(profile)
+        if (accessPointEvidence(holdsNetwork, broadcasting) == AccessPointEvidence.NONE) {
             // The silence here was a hole. Five identical "no hotspot is running" errors in a
             // rider log (samsung SM-S948B, qj-5G-d8cf, 2026-08-23) said nothing about whether
             // this road had even been considered, let alone which of its two answers had closed
@@ -297,8 +317,15 @@ object TBoxLinkResolver {
         }
         ProjectionEventLog.record(
             "NETWORK",
-            "No hosted network, but ${profile.ssid} is broadcasting - joining its access point " +
-                "instead. This motorcycle is saved as \"My phone hosts the hotspot\"; if the " +
+            (
+                if (holdsNetwork) {
+                    "No hosted network, but this phone is already on ${profile.ssid}'s access " +
+                        "point - taking it instead."
+                } else {
+                    "No hosted network, but ${profile.ssid} is broadcasting - joining its access " +
+                        "point instead."
+                }
+                ) + " This motorcycle is saved as \"My phone hosts the hotspot\"; if the " +
                 "access point keeps working, change the mode in manual pairing to skip this step."
         )
         return networkConnector.connect(profile)
@@ -370,3 +397,37 @@ object TBoxLinkResolver {
     private fun addressesTheNetworkStackIsUsing(context: Context): Set<InetAddress> =
         TBoxHotspotScan.addressesInUse(context)
 }
+
+/**
+ * Which evidence, if any, opens the access-point road for a motorcycle saved as PHONE_HOTSPOT.
+ *
+ * Split out of [TBoxLinkResolver] because it is the whole of the decision and none of the
+ * plumbing: the two roads that lead to the same join differ only in what they can prove, and a
+ * rider log can be replayed against this without a Wi-Fi stack.
+ */
+internal enum class AccessPointEvidence {
+    /**
+     * A network this connector is still holding for the profile's SSID. Strictly stronger than a
+     * sighting - the phone is not looking at the dash's access point, it is ON it - and immune to
+     * the scan throttling that made [SCAN_SIGHTING] unavailable for minutes at a time.
+     */
+    HELD_NETWORK,
+
+    /** The dash was in the phone's latest Wi-Fi scan, and that scan was recent enough to count. */
+    SCAN_SIGHTING,
+
+    /** Neither. The hotspot message stands, and it is the right message for a Wi-Fi-client dash. */
+    NONE
+}
+
+/**
+ * @param broadcasting the scan's answer, with null for "this phone handed back nothing usable".
+ *   Not consulted at all when [holdsNetwork] is true, which is why null is the ordinary value
+ *   there rather than a missing reading.
+ */
+internal fun accessPointEvidence(holdsNetwork: Boolean, broadcasting: Boolean?): AccessPointEvidence =
+    when {
+        holdsNetwork -> AccessPointEvidence.HELD_NETWORK
+        broadcasting == true -> AccessPointEvidence.SCAN_SIGHTING
+        else -> AccessPointEvidence.NONE
+    }
