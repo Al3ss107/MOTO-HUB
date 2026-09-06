@@ -38,16 +38,21 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 
 private const val MOTO_HUB_SIMULATOR_MODEL_ID = "MOTO-HUB-SIMULATOR"
 internal const val RIDE_DAEMON_STARTUP_TIMEOUT_SEC = 25L
@@ -89,6 +94,242 @@ private const val REJECTED_FRAME_LOG_INTERVAL = 100L
 
 internal fun isCurrentRideDaemonSession(callbackGeneration: Long, activeGeneration: Long): Boolean =
     callbackGeneration != 0L && callbackGeneration == activeGeneration
+
+/**
+ * How long a sweep confirmation is held back to let an advertisement that is still in flight
+ * overtake it. Both roads go live in the same breath on a hosted network - the dash takes its
+ * lease, opens 10930 and starts advertising within a second of each other - and the sweep leads
+ * with the address the dash announced, so a 250ms connect can beat an mDNS resolve round-trip by
+ * a hair. An mDNS resolve on a quiet hotspot is tens of milliseconds, so a second is generous;
+ * it is paid only on the branch where the sweep won, after the rider has already waited at least
+ * [HOTSPOT_NSD_LAST_CALL_MS] worth of window, and it buys the port and the package name the dash
+ * publishes itself instead of the well-known port and a probe-ladder identity.
+ */
+internal const val HOTSPOT_NSD_GRACE_MS = 1_000L
+
+/**
+ * How long the advertisement listener is kept after the sweep has walked the whole subnet and
+ * found nothing. The same length as a standard discovery window, and it exists because of what
+ * rider 6e77dcf7 did next: his sweep gave up at 11:11:52, he pressed connect again, and at
+ * 11:12:06 the advertisement resolved in 180ms. That retry cost him more than this window does,
+ * and it proved the dash was on the hotspot the whole time - just not at an address the
+ * single-pass sweep had left to try.
+ */
+internal const val HOTSPOT_NSD_LAST_CALL_MS = 15_000L
+
+/** Which of the two roads on a phone-hosted network produced the endpoint. */
+internal enum class HotspotDiscoveryRoad {
+    /** The dash's own `_EasyConn._tcp.` advertisement, resolved over NSD. */
+    ADVERTISEMENT,
+
+    /** A completed CMD_MDNS_RESPOND handshake found by the hosted-subnet sweep. */
+    SWEEP
+}
+
+/**
+ * What either road can report back to [HotspotDiscoveryRace]. Timestamps are milliseconds since
+ * discovery started on this link, so the whole policy can be replayed from a field log's own
+ * relative times without a clock.
+ */
+internal sealed interface HotspotDiscoveryEvent {
+    val atMs: Long
+
+    /** NSD resolved an acceptable advertisement. */
+    data class NsdResolved(override val atMs: Long, val host: TBoxHost) : HotspotDiscoveryEvent
+
+    /**
+     * The listener itself died - a failed `startServiceDiscovery`, not silence. NSD is never
+     * timed out from the outside any more, so this is the only way it leaves the race early.
+     */
+    data class NsdStopped(override val atMs: Long, val cause: Throwable) : HotspotDiscoveryEvent
+
+    /** The sweep completed a full CMD_MDNS_RESPOND handshake with an address on the subnet. */
+    data class SweepConfirmed(override val atMs: Long, val host: TBoxHost) : HotspotDiscoveryEvent
+
+    /** The sweep walked every candidate address and none completed the handshake. */
+    data class SweepExhausted(override val atMs: Long) : HotspotDiscoveryEvent
+
+    /** The caller's timer reached the deadline the last verdict asked for. */
+    data class DeadlineReached(override val atMs: Long) : HotspotDiscoveryEvent
+}
+
+internal sealed interface HotspotDiscoveryVerdict {
+    /**
+     * Nothing decided yet. [startSweep] is set on the single verdict that must launch the sweep;
+     * [deadlineAtMs] is the instant (again, milliseconds since discovery started) at which the
+     * caller must feed a [HotspotDiscoveryEvent.DeadlineReached], or null when only the two roads
+     * can move the race on and no timer is needed.
+     */
+    data class KeepGoing(val startSweep: Boolean, val deadlineAtMs: Long?) : HotspotDiscoveryVerdict
+
+    data class Adopt(
+        val host: TBoxHost,
+        val road: HotspotDiscoveryRoad,
+        val atMs: Long
+    ) : HotspotDiscoveryVerdict
+
+    /** Neither road found the dash. [nsdStoppedBy] is null when the listener merely stayed silent. */
+    data class GiveUp(val listenedMs: Long, val nsdStoppedBy: Throwable?) : HotspotDiscoveryVerdict
+}
+
+/**
+ * The referee for the two roads to a dash on a phone-hosted network: the `_EasyConn._tcp.`
+ * advertisement listener and the hosted-subnet sweep. Kept free of Android, sockets and
+ * coroutines on purpose - the bug this exists to prevent is a scheduling one, and a scheduling
+ * rule that can only be exercised by putting a real motorcycle on a real hotspot is a rule that
+ * gets broken again.
+ *
+ * The order of business, and why:
+ *  - NSD listens alone for the first [sweepJoinsAtMs]. The sweep is 253 TCP connects; a dash that
+ *    is already on the hotspot answers the advertisement in a fraction of a second (180ms for
+ *    rider 6e77dcf7 on 2026-09-06), so the common case must not pay for the sweep at all, and the
+ *    sweep's traffic stays off the air during the window mDNS multicast needs.
+ *  - When the sweep joins, NSD is NOT torn down. That teardown is the whole defect: the sweep is
+ *    a single pass, so a dash that takes its lease after the sweep has already tried that address
+ *    is invisible to it forever, while a listener that is still registered hears the announcement
+ *    the instant it goes out.
+ *  - An advertisement wins whenever it arrives. It carries the port the dash actually advertises
+ *    and the package name it publishes; the sweep can only ever report the well-known port and an
+ *    identity from the probe ladder.
+ *  - A sweep confirmation is held for [nsdGraceMs] first, so that an advertisement already on the
+ *    wire still wins, and is adopted when that expires. It is not held longer than that: a
+ *    completed CMD_MDNS_RESPOND handshake is the same proof the Wi-Fi Direct path accepts as an
+ *    endpoint, so there is nothing to wait for beyond the richer metadata.
+ *  - When the sweep is exhausted the listener gets [nsdLastCallMs] on its own before the rider is
+ *    told nothing answered.
+ */
+internal class HotspotDiscoveryRace(
+    private val sweepJoinsAtMs: Long,
+    private val nsdGraceMs: Long = HOTSPOT_NSD_GRACE_MS,
+    private val nsdLastCallMs: Long = HOTSPOT_NSD_LAST_CALL_MS
+) {
+    private var nsdListening = true
+    private var nsdStoppedBy: Throwable? = null
+    private var sweepStarted = false
+    private var sweepRanToTheEnd = false
+    private var heldSweepHost: TBoxHost? = null
+    private var decided = false
+
+    /** The opening verdict: NSD alone, with the sweep queued behind the head start. */
+    fun begin(): HotspotDiscoveryVerdict =
+        HotspotDiscoveryVerdict.KeepGoing(startSweep = false, deadlineAtMs = sweepJoinsAtMs)
+
+    fun offer(event: HotspotDiscoveryEvent): HotspotDiscoveryVerdict {
+        check(!decided) { "The hotspot discovery race is already decided." }
+        return when (event) {
+            is HotspotDiscoveryEvent.NsdResolved ->
+                decide(
+                    HotspotDiscoveryVerdict.Adopt(
+                        event.host,
+                        HotspotDiscoveryRoad.ADVERTISEMENT,
+                        event.atMs
+                    )
+                )
+
+            is HotspotDiscoveryEvent.NsdStopped -> {
+                nsdListening = false
+                nsdStoppedBy = event.cause
+                val held = heldSweepHost
+                when {
+                    // Nothing left to prefer it over: adopt the handshake we were holding.
+                    held != null ->
+                        decide(
+                            HotspotDiscoveryVerdict.Adopt(held, HotspotDiscoveryRoad.SWEEP, event.atMs)
+                        )
+
+                    sweepRanToTheEnd ->
+                        decide(HotspotDiscoveryVerdict.GiveUp(event.atMs, event.cause))
+
+                    // A listener that could not start is not a listener that might still hear
+                    // something, so the head start has nothing left to protect: sweep now rather
+                    // than spend the rest of it in silence.
+                    else -> {
+                        val launchNow = !sweepStarted
+                        sweepStarted = true
+                        HotspotDiscoveryVerdict.KeepGoing(startSweep = launchNow, deadlineAtMs = null)
+                    }
+                }
+            }
+
+            is HotspotDiscoveryEvent.SweepConfirmed ->
+                if (!nsdListening) {
+                    decide(
+                        HotspotDiscoveryVerdict.Adopt(event.host, HotspotDiscoveryRoad.SWEEP, event.atMs)
+                    )
+                } else {
+                    heldSweepHost = event.host
+                    HotspotDiscoveryVerdict.KeepGoing(
+                        startSweep = false,
+                        deadlineAtMs = event.atMs + nsdGraceMs
+                    )
+                }
+
+            is HotspotDiscoveryEvent.SweepExhausted -> {
+                sweepRanToTheEnd = true
+                if (!nsdListening) {
+                    decide(HotspotDiscoveryVerdict.GiveUp(event.atMs, nsdStoppedBy))
+                } else {
+                    HotspotDiscoveryVerdict.KeepGoing(
+                        startSweep = false,
+                        deadlineAtMs = event.atMs + nsdLastCallMs
+                    )
+                }
+            }
+
+            is HotspotDiscoveryEvent.DeadlineReached -> {
+                val held = heldSweepHost
+                when {
+                    // The grace expired with no advertisement on the wire after all.
+                    held != null ->
+                        decide(
+                            HotspotDiscoveryVerdict.Adopt(held, HotspotDiscoveryRoad.SWEEP, event.atMs)
+                        )
+
+                    // The last call expired: both roads are spent.
+                    sweepRanToTheEnd ->
+                        decide(HotspotDiscoveryVerdict.GiveUp(event.atMs, nsdStoppedBy))
+
+                    // The head start expired: the sweep joins, the listener stays.
+                    !sweepStarted -> {
+                        sweepStarted = true
+                        HotspotDiscoveryVerdict.KeepGoing(startSweep = true, deadlineAtMs = null)
+                    }
+
+                    else -> HotspotDiscoveryVerdict.KeepGoing(startSweep = false, deadlineAtMs = null)
+                }
+            }
+        }
+    }
+
+    private fun decide(verdict: HotspotDiscoveryVerdict): HotspotDiscoveryVerdict {
+        decided = true
+        return verdict
+    }
+}
+
+/**
+ * The sentence the rider is shown when neither road found the dash. It has to name both, because
+ * they now run together: with the sweep behind the advertisement window there was a "sweeping"
+ * line in the log marking the exact moment NSD gave up, and there no longer is one to point at.
+ * A listener that could not be started at all is called out separately - that is a fault on this
+ * phone, not a dash that stayed quiet, and it sends the reader somewhere else entirely.
+ */
+internal fun describeHotspotDiscoveryFailure(verdict: HotspotDiscoveryVerdict.GiveUp): String {
+    val seconds = verdict.listenedMs / 1_000L
+    val advice = "Check that the dash shows it is connected, and that the hotspot Ssid and " +
+        "Password match exactly what the dash is asking for."
+    val stopped = verdict.nsdStoppedBy
+    return if (stopped != null) {
+        "No motorcycle answered on the hotspot your phone is hosting. This phone could not " +
+            "listen for the dash's announcement at all (${stopped.message ?: stopped::class.java.simpleName}), " +
+            "and in ${seconds}s no address on the hotspot subnet completed the EasyConn " +
+            "handshake either. $advice"
+    } else {
+        "No motorcycle answered on the hotspot your phone is hosting: nothing announced " +
+            "_EasyConn._tcp. in ${seconds}s of listening, and no address on the hotspot subnet " +
+            "completed the EasyConn handshake in that time. $advice"
+    }
+}
 
 /** Kotlin boundary around the GPL gomobile binding. Network selection stays outside this class. */
 class RideDaemonTransport(
@@ -752,41 +993,180 @@ class RideDaemonTransport(
     }
 
     /**
-     * Discovery when the phone hosts the network. NSD is given one window first - it costs a few
-     * seconds and would hand back the service package too, which the sweep cannot - then every
+     * Discovery when the phone hosts the network. Two roads to the same dash, refereed against one
+     * clock by [HotspotDiscoveryRace]: NSD listens for the dash's own `_EasyConn._tcp.`
+     * announcement, and - once NSD has had the first [DISCOVERY_TIMEOUT_MS] to itself - every
      * address on the tethering subnet is probed on the well-known port, nearest the phone first.
      *
-     * The endpoint is adopted only when the full CMD_MDNS_RESPOND handshake completes, exactly as
-     * on the other two transports: an open TCP port is never promoted on its own.
+     * They used to run one after the other, and that sequence cost rider 6e77dcf7 (samsung
+     * SM-S948B, MOTO-HUB 1.1.112, 2026-09-06) a whole connection. He switched his hotspot on at
+     * 11:10:21; NSD heard nothing by 11:10:36 and was torn down; the sweep then walked 253
+     * addresses until 11:11:52 and reported nothing. He pressed connect again at 11:12:06 and the
+     * advertisement resolved 180ms later. The dash had simply not associated during the first
+     * window - on a phone-hosted network it has to boot, see the hotspot, associate, take a lease
+     * and only then advertise, so arriving late is the normal case here, not the exception - and
+     * the sweep is a single pass, so the address the dash eventually took was one the sweep had
+     * already tried and would never look at again. A listener that was still registered would have
+     * ended those 75 seconds the moment the announcement went out.
+     *
+     * NSD keeps its privileges: it is the only road that reports the port the dash advertises and
+     * the package name it publishes, so its answer is taken whenever it arrives and a sweep
+     * confirmation is held [HOTSPOT_NSD_GRACE_MS] for it. The sweep's own guarantee is untouched:
+     * an open TCP port is never promoted on its own, the endpoint is adopted only when the full
+     * CMD_MDNS_RESPOND handshake completes.
      */
     private suspend fun discoverOverPhoneHotspot(
         link: TBoxLink.PhoneHotspot,
         expectedModelId: String?
-    ): TBoxHost {
-        try {
-            return withTimeout(DISCOVERY_TIMEOUT_MS) { discoverWithAndroidNsd(link, expectedModelId) }
-        } catch (timeout: TimeoutCancellationException) {
-            kotlinx.coroutines.currentCoroutineContext().ensureActive()
-            ProjectionEventLog.record(
-                "DISCOVERY",
-                "No EasyConn advertisement on the hosted network; sweeping " +
-                    "${link.subnet.localAddress.hostAddress}/${link.subnet.prefixLength} for the dash."
-            )
-        }
-        val found = probeHostedSubnet(link)
-            ?: throw IllegalStateException(
-                "No motorcycle answered on the hotspot your phone is hosting. Check that the dash " +
-                    "shows it is connected, and that the hotspot Ssid and Password match exactly " +
-                    "what the dash is asking for."
-            )
-        val (host, identity) = found
-        val address = host.hostAddress
-            ?: throw IllegalStateException("The dash answered but its address could not be read.")
-        ProjectionEventLog.record(
-            "DISCOVERY",
-            "EasyConn endpoint confirmed on the hosted network at $address:$WAKE_PROBE_PORT."
+    ): TBoxHost = coroutineScope {
+        val startedAtMs = SystemClock.elapsedRealtime()
+        fun sinceStart(): Long = SystemClock.elapsedRealtime() - startedAtMs
+        // UNLIMITED, so that handing a result over can never suspend: a blocking send from inside
+        // the NSD continuation or the sweep's IO loop would be one more place a race being torn
+        // down could get stuck, and the multicast lock is held until that teardown runs.
+        val outcomes = Channel<HotspotDiscoveryEvent>(Channel.UNLIMITED)
+        val race = HotspotDiscoveryRace(
+            sweepJoinsAtMs = DISCOVERY_TIMEOUT_MS,
+            nsdGraceMs = HOTSPOT_NSD_GRACE_MS,
+            nsdLastCallMs = HOTSPOT_NSD_LAST_CALL_MS
         )
-        return TBoxHost(address, WAKE_PROBE_PORT, identity)
+
+        val nsdJob = launch {
+            val outcome = try {
+                // The host first, the timestamp second: argument order would otherwise stamp the
+                // event with the moment the listener was registered rather than the moment the
+                // dash announced itself, and how late the announcement was is the whole point of
+                // the line the rider ends up reading.
+                val resolved = discoverWithAndroidNsd(link, expectedModelId)
+                HotspotDiscoveryEvent.NsdResolved(sinceStart(), resolved)
+            } catch (cancellation: CancellationException) {
+                // The race is over, or the rider left MOTO-HUB. Either way
+                // discoverWithAndroidNsd's invokeOnCancellation has already unregistered the
+                // listener and released the multicast lock; there is nothing left to report.
+                throw cancellation
+            } catch (failure: Throwable) {
+                HotspotDiscoveryEvent.NsdStopped(sinceStart(), failure)
+            }
+            outcomes.trySend(outcome)
+        }
+
+        var sweepJob: Job? = null
+        fun joinSweepToTheRace() {
+            if (sweepJob != null) return
+            sweepJob = launch {
+                ProjectionEventLog.record(
+                    "DISCOVERY",
+                    "Still no EasyConn advertisement after ${DISCOVERY_TIMEOUT_MS / 1000}s; " +
+                        "sweeping ${link.subnet.localAddress.hostAddress}/" +
+                        "${link.subnet.prefixLength} for the dash. The advertisement listener " +
+                        "stays registered alongside the sweep - whichever road reaches the dash " +
+                        "first ends discovery."
+                )
+                val found = try {
+                    probeHostedSubnet(link)
+                } catch (cancellation: CancellationException) {
+                    throw cancellation
+                } catch (failure: Throwable) {
+                    ProjectionEventLog.warning(
+                        "DISCOVERY",
+                        "Hosted-network sweep ended in an error; the advertisement listener is " +
+                            "now the only road left.",
+                        failure
+                    )
+                    null
+                }
+                val address = found?.first?.hostAddress
+                if (found != null && address == null) {
+                    ProjectionEventLog.warning(
+                        "DISCOVERY",
+                        "The sweep completed the EasyConn handshake with a dash whose address " +
+                            "could not be read; leaving the advertisement listener to finish."
+                    )
+                }
+                outcomes.trySend(
+                    if (found != null && address != null) {
+                        HotspotDiscoveryEvent.SweepConfirmed(
+                            sinceStart(),
+                            TBoxHost(address, WAKE_PROBE_PORT, found.second)
+                        )
+                    } else {
+                        HotspotDiscoveryEvent.SweepExhausted(sinceStart())
+                    }
+                )
+            }
+        }
+
+        // Feeds the referee until it decides. Every exit from here - a host, the rider-facing
+        // failure, or the rider leaving - goes through the finally below, so neither road is ever
+        // left running.
+        suspend fun settle(): TBoxHost {
+            var verdict: HotspotDiscoveryVerdict = race.begin()
+            while (true) {
+                when (val current = verdict) {
+                    is HotspotDiscoveryVerdict.Adopt -> {
+                        ProjectionEventLog.record(
+                            "DISCOVERY",
+                            describeAdoptedHotspotHost(current, sweepWasRunning = sweepJob != null)
+                        )
+                        return current.host
+                    }
+
+                    is HotspotDiscoveryVerdict.GiveUp ->
+                        throw IllegalStateException(describeHotspotDiscoveryFailure(current))
+
+                    is HotspotDiscoveryVerdict.KeepGoing -> {
+                        if (current.startSweep) joinSweepToTheRace()
+                        val deadlineAtMs = current.deadlineAtMs
+                        verdict = race.offer(
+                            if (deadlineAtMs == null) {
+                                outcomes.receive()
+                            } else {
+                                withTimeoutOrNull(deadlineAtMs - sinceStart()) { outcomes.receive() }
+                                    ?: HotspotDiscoveryEvent.DeadlineReached(sinceStart())
+                            }
+                        )
+                    }
+                }
+            }
+        }
+
+        try {
+            settle()
+        } finally {
+            // The loser is torn down here, and so is everything still running when the rider walks
+            // away. Cancelling the NSD job runs discoverWithAndroidNsd's invokeOnCancellation,
+            // which unregisters the listener and releases the multicast lock; the sweep is blocked
+            // in a socket, so it notices at its next ensureActive(): HOSTED_SWEEP_CONNECT_TIMEOUT_MS
+            // on the cheap first pass, but ~5.25s on the identity ladder, whose probe sets
+            // soTimeout = WAKE_PROBE_READ_TIMEOUT_MS on top of the connect. Harmless because what
+            // is being waited on is a socket, not a lock or a listener - the multicast lock and
+            // the NSD registration are already gone by then. coroutineScope waits for both before this
+            // function returns, which is the point: no listener outlives the discovery it belongs to.
+            nsdJob.cancel()
+            sweepJob?.cancel()
+        }
+    }
+
+    /**
+     * The one line that says which road won, and how far into discovery. Worth spelling out rather
+     * than logging "endpoint confirmed" for both: from a rider's log alone, "the dash advertised"
+     * and "the dash was found by walking the subnet" are two different stories about that dash's
+     * firmware, and now that the two roads overlap the timestamps no longer tell them apart.
+     */
+    private fun describeAdoptedHotspotHost(
+        adopted: HotspotDiscoveryVerdict.Adopt,
+        sweepWasRunning: Boolean
+    ): String = when (adopted.road) {
+        HotspotDiscoveryRoad.ADVERTISEMENT ->
+            "EasyConn advertisement resolved ${adopted.atMs}ms into discovery at " +
+                "${adopted.host.ipAddress}:${adopted.host.port}" +
+                (if (sweepWasRunning) ", with the hosted-network sweep still running" else "") +
+                "; the advertisement wins - it carries the dash's own port and package name."
+
+        HotspotDiscoveryRoad.SWEEP ->
+            "EasyConn endpoint confirmed on the hosted network at " +
+                "${adopted.host.ipAddress}:${adopted.host.port} by the sweep, " +
+                "${adopted.atMs}ms into discovery; nothing was advertised in that time."
     }
 
     /**
