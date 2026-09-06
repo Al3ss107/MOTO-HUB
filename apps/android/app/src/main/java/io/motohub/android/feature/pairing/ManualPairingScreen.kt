@@ -47,6 +47,12 @@ fun ManualPairingScreen(
     password: String,
     connectionMode: TBoxConnectionMode,
     formError: String?,
+    /**
+     * A name the phone has evidence for, which [ssid] differs from only by spacing or
+     * punctuation. Null unless there is one - see [manualSsidVerdict].
+     */
+    ssidSuggestion: String?,
+    onAcceptSsidSuggestion: () -> Unit,
     onSsidChanged: (String) -> Unit,
     onPasswordChanged: (String) -> Unit,
     onConnectionModeChanged: (TBoxConnectionMode) -> Unit,
@@ -114,6 +120,23 @@ fun ManualPairingScreen(
             )
             formError?.let {
                 Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+            }
+            // Deliberately not an error colour, and deliberately not blocking. The rider may well
+            // be right; this only makes the other reading visible before a second motorcycle is
+            // created that can never be joined.
+            ssidSuggestion?.let { suggestion ->
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        motoHubText("No network called ") + "\"" + ssid + "\"" +
+                            motoHubText(" has been seen, but this phone knows ") + "\"" + suggestion +
+                            "\"" + motoHubText(", which differs only in spacing. Save again to keep what you typed."),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    TextButton(onClick = onAcceptSsidSuggestion) {
+                        Text(motoHubText("Use ") + suggestion)
+                    }
+                }
             }
 
             Button(

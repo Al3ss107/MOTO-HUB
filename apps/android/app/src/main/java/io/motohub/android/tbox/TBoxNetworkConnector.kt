@@ -720,6 +720,25 @@ class TBoxNetworkConnector(context: Context) {
             ?: @Suppress("DEPRECATION") SSID.orEmpty().removeSurrounding("\"")
 
     /**
+     * Every network name in the phone's latest usable scan, for asking a question about a name a
+     * rider typed rather than about one dash - see
+     * [io.motohub.android.feature.pairing.manualSsidVerdict].
+     *
+     * Empty means "nothing to say", never "nothing is there". Same freshness rule as
+     * [isDashBroadcasting]: a list taken before the dash was switched on has already cost one
+     * rider his ride (36a3fd37), and here it would put a stale name into a question, which is
+     * worse than asking nothing.
+     */
+    @SuppressLint("MissingPermission")
+    fun visibleSsids(): List<String> {
+        val results = runCatching { wifiManager.scanResults }.getOrNull() ?: return emptyList()
+        if (results.isEmpty()) return emptyList()
+        val newest = results.maxOf { it.timestamp }
+        if (!scanEvidenceIsFresh(newest, SystemClock.elapsedRealtime())) return emptyList()
+        return results.map { it.ssidText() }.filter { it.isNotBlank() }.distinct()
+    }
+
+    /**
      * Whether the dash is broadcasting its own SSID right now - **null when that cannot be said**.
      *
      * Tri-state is the whole point. A dash that is visibly on the air proves a PHONE_HOTSPOT

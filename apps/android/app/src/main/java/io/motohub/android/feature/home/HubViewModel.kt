@@ -8,6 +8,8 @@ import io.motohub.android.i18n.motoHubText
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.motohub.android.data.MotorcycleProfileStore
+import io.motohub.android.feature.pairing.ManualSsidVerdict
+import io.motohub.android.feature.pairing.manualSsidVerdict
 import io.motohub.android.feature.pairing.withModelIdForConnectionMode
 import io.motohub.android.session.ConnectionProgressNotification
 import io.motohub.android.session.HubSessionState
@@ -53,6 +55,12 @@ data class HubUiState(
     val password: String = "",
     val connectionMode: TBoxConnectionMode = TBoxConnectionMode.AUTO,
     val formError: String? = null,
+    /**
+     * A network name the phone has evidence for, which the one the rider typed differs from only
+     * by spacing or punctuation. Set by [HubViewModel.saveMotorcycle] instead of saving, cleared
+     * by editing the field or by accepting it. See [manualSsidVerdict] for why it is a question.
+     */
+    val ssidSuggestion: String? = null,
     /**
      * The motorcycle whose last session streamed happily and now needs the one thing the protocol
      * cannot report: whether anything appeared on the dashboard. Null unless the wire ladder is
@@ -213,7 +221,26 @@ class HubViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun onSsidChanged(value: String) {
-        mutableUiState.value = mutableUiState.value.copy(ssid = value, formError = null)
+        // Editing the name withdraws the question: whatever the rider does next is their answer to
+        // it, and a suggestion still standing would fire again against text it was never about.
+        mutableUiState.value = mutableUiState.value.copy(ssid = value, formError = null, ssidSuggestion = null)
+    }
+
+    /**
+     * Takes the name [saveMotorcycle] offered and puts it in the field, without saving.
+     *
+     * Not saved outright, because the password beside it may be the one the rider was still
+     * typing - and one more tap on a button already under their thumb is a smaller price than a
+     * motorcycle saved with half a password.
+     */
+    fun acceptSsidSuggestion() {
+        val suggestion = mutableUiState.value.ssidSuggestion ?: return
+        ProjectionEventLog.record("PAIRING", "Rider took the suggested network name \"$suggestion\".")
+        mutableUiState.value = mutableUiState.value.copy(
+            ssid = suggestion,
+            ssidSuggestion = null,
+            formError = null
+        )
     }
 
     fun onPasswordChanged(value: String) {
@@ -231,6 +258,35 @@ class HubViewModel(application: Application) : AndroidViewModel(application) {
         if (normalizedSsid.isEmpty()) {
             ProjectionEventLog.warning("PAIRING", "Manual profile save rejected because the SSID is empty.")
             mutableUiState.value = current.copy(formError = "Enter the motorcycle Wi-Fi network name.")
+            return false
+        }
+
+        // A name typed by hand, checked against what this phone actually knows before it becomes
+        // a second motorcycle. Rider 168b97bb typed "CFMOTO 6627" for a dash broadcasting
+        // CFMOTO6627 on a phone that already had a working profile for it, and got a motorcycle
+        // that could never be joined plus forty minutes of "the dash is not broadcasting".
+        //
+        // Asked once, and only once: accepting the suggestion or editing the field clears it, and
+        // pressing Save again on the same text saves it. A rider who really does have a space in
+        // their SSID loses one tap, and gets the right motorcycle either way.
+        val verdict = manualSsidVerdict(
+            typed = normalizedSsid,
+            savedSsids = current.motorcycles.map { it.ssid },
+            visibleSsids = networkConnector.visibleSsids()
+        )
+        if (verdict is ManualSsidVerdict.DidYouMean && current.ssidSuggestion != verdict.candidate) {
+            ProjectionEventLog.warning(
+                "PAIRING",
+                "Manual profile for \"$normalizedSsid\" put on hold: it differs only in spacing " +
+                    "or punctuation from \"${verdict.candidate}\", which this phone " +
+                    when (verdict.source) {
+                        ManualSsidVerdict.DidYouMean.Source.SAVED_MOTORCYCLE ->
+                            "already has saved as a motorcycle"
+                        ManualSsidVerdict.DidYouMean.Source.ON_THE_AIR ->
+                            "can see on the air right now"
+                    } + ". Asking the rider which one they meant."
+            )
+            mutableUiState.value = current.copy(ssidSuggestion = verdict.candidate, formError = null)
             return false
         }
 
@@ -257,7 +313,8 @@ class HubViewModel(application: Application) : AndroidViewModel(application) {
         mutableUiState.value = current.copy(
             motorcycles = current.motorcycles.replaceProfile(profile),
             session = current.session.withMotorcycle(profile),
-            formError = null
+            formError = null,
+            ssidSuggestion = null
         )
         ProjectionEventLog.record(
             "PAIRING",

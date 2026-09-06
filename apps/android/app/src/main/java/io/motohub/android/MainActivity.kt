@@ -1381,6 +1381,8 @@ class MainActivity : ComponentActivity() {
                         password = state.password,
                         connectionMode = state.connectionMode,
                         formError = state.formError,
+                        ssidSuggestion = state.ssidSuggestion,
+                        onAcceptSsidSuggestion = viewModel::acceptSsidSuggestion,
                         onSsidChanged = viewModel::onSsidChanged,
                         onPasswordChanged = viewModel::onPasswordChanged,
                         onConnectionModeChanged = viewModel::onConnectionModeChanged,
