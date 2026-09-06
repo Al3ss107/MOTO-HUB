@@ -400,7 +400,7 @@ class TBoxNetworkConnector(context: Context) {
             "NETWORK",
             "Requesting Android Wi-Fi network for SSID ${profile.ssid}; " +
                 "passwordPresent=${profile.password.isNotEmpty()}; " +
-                "the phone is currently ${currentWifiDescription()}."
+                "the phone is currently ${currentWifiDescription(profile.ssid)}."
         )
         submitSpecifierRequest(profile)
         return awaitRequestedNetwork(profile)
@@ -698,19 +698,33 @@ class TBoxNetworkConnector(context: Context) {
      * The SSID needs location permission and CORE does not hold it, so the name is often
      * withheld. Whether the phone is on SOME Wi-Fi is the half that matters and
      * [ConnectivityManager] answers it without any permission at all.
+     *
+     * ONE name is printed and only one: [target], when the phone turns out to be on it already.
+     * That is a fact about the motorcycle, it is already written on the line above this one, and
+     * it changes what happens next - being on the dash's own access point is why a connect can
+     * succeed with no join at all. Any OTHER network is named "another Wi-Fi" and nothing more.
+     *
+     * Rider 6e77dcf7's log printed "on Wi-Fi Sztik" four times: his home network, in a file
+     * riders paste into public threads, on a value that public wardriving databases map back to
+     * a street. It bought nothing - the diagnosis this line exists for is "was the phone on some
+     * other Wi-Fi", not which one - and it is the same argument this file already makes for
+     * BSSIDs a few hundred lines down: stable identifiers do not go in a shared log.
      */
     @SuppressLint("MissingPermission")
-    private fun currentWifiDescription(): String {
+    private fun currentWifiDescription(target: String): String {
         val onWifi = connectivityManager.activeNetwork
             ?.let { connectivityManager.getNetworkCapabilities(it) }
             ?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
         if (!onWifi) return "not on any Wi-Fi"
         val ssid = runCatching { normalizeSsid(wifiManager.connectionInfo?.ssid.orEmpty()) }
             .getOrDefault("")
+        val normalizedTarget = normalizeSsid(target)
         return when {
             ssid.isBlank() || ssid == "<unknown ssid>" ->
                 "on another Wi-Fi whose name Android withholds - Android has to leave it first"
-            else -> "on Wi-Fi $ssid - Android has to leave it first"
+            ssid.equals(normalizedTarget, ignoreCase = true) ->
+                "already on $ssid - no join is needed unless Android has handed it to someone else"
+            else -> "on another Wi-Fi - Android has to leave it first"
         }
     }
 
