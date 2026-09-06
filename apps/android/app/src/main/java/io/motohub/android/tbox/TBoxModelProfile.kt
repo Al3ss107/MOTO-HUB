@@ -725,17 +725,33 @@ enum class TBoxModelProfile(
             val byId = fromModelId(modelId)
             if (byId != GENERIC) return byId
             if (capabilities == null) return GENERIC
-            // Restrict scoring to profiles that share the (ambiguous) modelId when one was
-            // provided at all - e.g. only the three CFDL26 variants compete for "37426", never
-            // a profile the modelId itself doesn't claim. Only opens up to every profile when
-            // there was no modelId lead to begin with.
+            return clientInfoContenders(modelId, capabilities)
+                .maxByOrNull { (_, points) -> points }
+                ?.first
+                ?: GENERIC
+        }
+
+        /**
+         * Every profile that CLIENT_INFO says something positive about, with its score, in
+         * declaration order - the shortlist [resolve] then picks the highest scorer from.
+         *
+         * Restricted to profiles that share the (ambiguous) modelId when one was provided at
+         * all - e.g. only the three CFDL26 variants compete for "37426", never a profile the
+         * modelId itself doesn't claim. Only opens up to every profile when there was no
+         * modelId lead to begin with.
+         *
+         * Split out of [resolve] because the winner alone does not say how it won.
+         * [hasValidatedAndroidAutoPreset] needs the whole shortlist: a profile that beat a
+         * rival of the opposite orientation by a point or two was picked, not identified.
+         */
+        internal fun clientInfoContenders(
+            modelId: String?,
+            capabilities: TBoxCapabilities
+        ): List<Pair<TBoxModelProfile, Int>> {
             val candidates = candidatesForModelId(modelId).ifEmpty { entries.filterNot { it == GENERIC } }
             return candidates
                 .map { it to score(it, capabilities) }
                 .filter { (_, points) -> points > 0 }
-                .maxByOrNull { (_, points) -> points }
-                ?.first
-                ?: GENERIC
         }
 
         /**
@@ -933,19 +949,57 @@ enum class TBoxModelProfile(
             resolve(modelId, capabilities, profileOverride).defaultAndroidAutoPreset
 
         /**
-         * True when [defaultAndroidAutoPreset] comes from a recognized dash rather than
-         * [GENERIC]. Only a recognized profile's orientation is evidence about the hardware;
-         * see AndroidAutoCapabilityProfiles.usableSavedGeometryForAuto.
+         * True when the resolved [defaultAndroidAutoPreset]'s ORIENTATION is evidence about this
+         * particular dashboard, and may therefore outrank a live projection area the dash
+         * measured and reported about itself; see
+         * AndroidAutoCapabilityProfiles.usableSavedGeometryForAuto, which both reads and saves
+         * behind this answer.
          *
-         * A rider who pinned [ProfileOverride.GENERIC] is stating the opposite — that nothing here
-         * is known-good — so the override has to reach this answer too, otherwise the pin would
-         * silently keep the veto of whichever profile detection had guessed.
+         * Exactly three things count as that evidence:
+         *  - a rider's pin, which is the owner naming their own motorcycle. A rider who pinned
+         *    [ProfileOverride.GENERIC] is stating the opposite — that nothing here is known-good —
+         *    so that pin has to reach this answer too, otherwise it would silently keep the veto
+         *    of whichever profile detection had guessed.
+         *  - a modelId that names exactly one profile, which is the dashboard identifying its own
+         *    hardware in its QR code.
+         *  - a CLIENT_INFO match that no other contender's orientation disputes.
+         *
+         * That last clause is what rider 6e77dcf7 (samsung SM-S948B, 2026-09-06, MOTO-HUB
+         * 1.1.112) cost us. His CFMOTO6627 dash carries modelId 37426, which three profiles
+         * claim: CFDL26_LANDSCAPE and CFDL26_PORTRAIT scored 14 each, CFDL26_NK_TOUCH 16 — and
+         * the entire margin was `supportScreenTouch` plus `supportMirrorOverlayTouch`, two
+         * generic EasyConn capability flags this file warns three separate times must only
+         * corroborate an identity, never establish one. Here they were establishing an
+         * ORIENTATION: NK_TOUCH's portrait 720x1280 preset then vetoed the 784x576 LANDSCAPE
+         * area the dash asked for over CAPTURE_CONFIG, and the same veto refused to save it, so
+         * every session composited Android Auto into 311x554 of a 784x576 panel — 38% of the
+         * screen — forever. Answering "was this profile identified, or merely picked?" instead
+         * of the old "is it non-GENERIC?" lets the measurement correct the guess, while a dash
+         * whose modelId or owner named it keeps the veto that stops a stale portrait area being
+         * saved for a real landscape 800NK.
+         *
+         * Narrowing the veto rather than the CFDL26 scoring is deliberate: the score is a fair
+         * reading of the evidence (this dash IS the touch variant as far as CLIENT_INFO can
+         * tell, and demoting it would break every 800NK Advanced that never reports a live
+         * area). What was wrong was treating a tie-break as a measurement.
          */
         fun hasValidatedAndroidAutoPreset(
             modelId: String?,
             capabilities: TBoxCapabilities?,
             profileOverride: ProfileOverride? = null
-        ): Boolean = resolve(modelId, capabilities, profileOverride) != GENERIC
+        ): Boolean {
+            val resolved = resolve(modelId, capabilities, profileOverride)
+            if (resolved == GENERIC) return false
+            if (profileOverride?.resolve() != null) return true
+            if (fromModelId(modelId) != GENERIC) return true
+            // Unreachable: with no pin and no modelId of its own, a null CLIENT_INFO resolves to
+            // GENERIC above. Kept total rather than forced, so a future caller cannot crash here.
+            val scored = capabilities ?: return true
+            val resolvedIsPortrait = resolved.defaultAndroidAutoPreset.isPortrait
+            return clientInfoContenders(modelId, scored).all { (contender, _) ->
+                contender.defaultAndroidAutoPreset.isPortrait == resolvedIsPortrait
+            }
+        }
 
         fun fallbackVideoArea(
             modelId: String?,

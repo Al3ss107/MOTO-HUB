@@ -244,6 +244,65 @@ class AndroidAutoCapabilityProfileTest {
         }
     }
 
+    /**
+     * Rider 6e77dcf7 (samsung SM-S948B, 2026-09-06, MOTO-HUB 1.1.112): a CFMOTO6627 dash asking
+     * for 784x576 LANDSCAPE over CAPTURE_CONFIG, matched to CFDL26_NK_TOUCH's portrait
+     * 720x1280 preset by two generic touch capability flags. The veto refused the area AND
+     * refused to save it, so the compositor letterboxed Android Auto into 311x554 of the panel
+     * - 38% of the screen - on every session, forever.
+     */
+    @Test
+    fun `keeps a landscape area a portrait preset only guessed at`() {
+        val target = DisplayGeometry(784, 576)
+
+        val usable = AndroidAutoCapabilityProfiles.usableSavedGeometryForAuto(
+            target,
+            AndroidAutoVideoPreset.PORTRAIT_720X1280,
+            fallbackIsValidated = false
+        )
+
+        assertEquals(target, usable)
+    }
+
+    @Test
+    fun `a measured landscape area still loses to a portrait profile that named the hardware`() {
+        // The other half of the same rule: 784x576 is no more trustworthy than 460x750 was when
+        // the profile behind the preset really did identify this dashboard.
+        val usable = AndroidAutoCapabilityProfiles.usableSavedGeometryForAuto(
+            DisplayGeometry(784, 576),
+            AndroidAutoVideoPreset.PORTRAIT_720X1280
+        )
+
+        assertNull(usable)
+    }
+
+    @Test
+    fun `the rescued landscape area buys back most of rider 6e77dcf7's panel`() {
+        // What the fix is actually worth. The portrait preset composited to 311x554 inside
+        // 784x576; the landscape source AUTO reaches from the measured area covers the full
+        // height and 83% of the width, and the aspect margins are what make up the rest.
+        val target = DisplayGeometry(784, 576)
+
+        val profile = AndroidAutoCapabilityProfiles.select(target).let {
+            it.copy(aspectMargins = AaAspectMargins.forPanel(it.video, target))
+        }
+
+        assertEquals(AndroidAutoVideoPreset.LANDSCAPE_800X480, profile.videoPreset)
+        assertEquals(AndroidAutoCapabilitySource.SAVED_TBOX_GEOMETRY, profile.source)
+        assertEquals(DisplayGeometry(653, 480), profile.touchSurface)
+        assertEquals(147, profile.marginWidth)
+        assertEquals(0, profile.marginHeight)
+    }
+
+    @Test
+    fun `orientation reads the same for every protocol source`() {
+        // usableSavedGeometryForAuto and TBoxModelProfile.hasValidatedAndroidAutoPreset compare
+        // orientations across two different objects; they have to mean the same thing by it.
+        AndroidAutoVideoPreset.entries.forEach { preset ->
+            assertEquals(preset.name, preset.source.height > preset.source.width, preset.isPortrait)
+        }
+    }
+
     @Test
     fun `manual HD portrait override exposes the supported Android Auto source`() {
         val profile = AndroidAutoCapabilityProfiles.select(

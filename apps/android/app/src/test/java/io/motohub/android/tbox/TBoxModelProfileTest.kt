@@ -531,4 +531,108 @@ class TBoxModelProfileTest {
         val clc450 = benelliTrk702x.copy(huName = "48FB4C-0001")
         assertEquals(TBoxModelProfile.CL_C450, TBoxModelProfile.resolve(null, clc450))
     }
+
+    /**
+     * Rider 6e77dcf7 (samsung SM-S948B, 2026-09-06, MOTO-HUB 1.1.112), SSID CFMOTO6627. A real
+     * CFDL26 CFMOTO dash whose identity fields are still the Carbit SDK's demo placeholders, so
+     * nothing in CLIENT_INFO says which of the three modelId-37426 panels it is - while the dash
+     * itself asks for a 784x576 LANDSCAPE area over CAPTURE_CONFIG, twice in the same log.
+     */
+    private val cfmoto6627 = TBoxCapabilities(
+        huName = "Android_f7d6",
+        carBrand = "test-car-brand",
+        carModel = "test-car-model",
+        packageName = "com.cfmoto.easyconnect",
+        versionName = "CFDL26.2.3.0.5",
+        sdkVersion = "1.1.2",
+        supportFunction = 128,
+        socketServerAuth = true,
+        screenTouch = true,
+        mirrorOverlayTouch = true,
+        dpi = 0
+    )
+
+    @Test
+    fun `rider 6e77dcf7's dash still scores as the 800NK Advanced touch panel`() {
+        // The scoring is NOT the thing being fixed, and this pins that: on the evidence
+        // CLIENT_INFO offers, the touch variant genuinely is the best reading. Demoting it would
+        // cost every real 800NK Advanced - the one panel here that never reports a live area -
+        // its measured 720x712 fallback.
+        assertEquals(
+            TBoxModelProfile.CFDL26_NK_TOUCH,
+            TBoxModelProfile.resolve("37426", cfmoto6627)
+        )
+        assertEquals(
+            io.motohub.android.androidauto.AndroidAutoVideoPreset.PORTRAIT_720X1280,
+            TBoxModelProfile.defaultAndroidAutoPreset("37426", cfmoto6627)
+        )
+        // The exact scores from the rider's log, and the exact margin: 16 to 14, all of it the
+        // two generic EasyConn touch flags.
+        assertEquals(
+            listOf(
+                TBoxModelProfile.CFDL26_LANDSCAPE to 14,
+                TBoxModelProfile.CFDL26_PORTRAIT to 14,
+                TBoxModelProfile.CFDL26_NK_TOUCH to 16
+            ),
+            TBoxModelProfile.clientInfoContenders("37426", cfmoto6627)
+        )
+    }
+
+    @Test
+    fun `an orientation decided by touch flags is not evidence against the dash's own area`() {
+        // The whole bug: two contenders of the opposite orientation matched the same identity
+        // evidence, so the winner's portrait preset is a tie-break, not a measurement, and must
+        // not veto (nor block the saving of) the 784x576 landscape area the dash reported.
+        assertFalse(TBoxModelProfile.hasValidatedAndroidAutoPreset("37426", cfmoto6627))
+    }
+
+    @Test
+    fun `a modelId that names one profile still keeps the orientation veto`() {
+        // The protection the veto was written for: a stale or emulator portrait area saved for a
+        // real landscape 800NK. Its QR names one profile and one only, so nothing here is a
+        // tie-break and the profile's orientation outranks whatever the firmware reports.
+        assertEquals(
+            true,
+            TBoxModelProfile.hasValidatedAndroidAutoPreset("66660703", cfmoto6627)
+        )
+        // Portrait side of the same rule, so this is not accidentally a landscape-only test.
+        assertEquals(true, TBoxModelProfile.hasValidatedAndroidAutoPreset("66660732", null))
+    }
+
+    @Test
+    fun `a rider's pin is evidence about their own motorcycle`() {
+        // A pin is the owner naming the panel in front of them, which is the strongest evidence
+        // this app can get - stronger than the area the dash reports about itself.
+        assertEquals(
+            true,
+            TBoxModelProfile.hasValidatedAndroidAutoPreset(
+                "37426",
+                cfmoto6627,
+                ProfileOverride.CFDL26_NK_TOUCH
+            )
+        )
+        // ...and pinning Generic still withdraws the veto, pin or no pin.
+        assertFalse(
+            TBoxModelProfile.hasValidatedAndroidAutoPreset(
+                "37426",
+                cfmoto6627,
+                ProfileOverride.GENERIC
+            )
+        )
+    }
+
+    @Test
+    fun `a CLIENT_INFO match no rival disputes keeps the orientation veto`() {
+        // The CRCP 800NK: identified by fingerprint alone, with no modelId to lead on. CL-C450
+        // also scores here (one point for the 0.9.23 dialect) but is landscape too, so nothing
+        // contests the orientation and the veto stands - a fingerprint match is not automatically
+        // a guess, only a contested one is.
+        val crcp = TBoxCapabilities(
+            huName = "CRCP-1E9714",
+            packageName = "linux_no_package",
+            sdkVersion = "0.9.23.9"
+        )
+        assertEquals(TBoxModelProfile.CFMOTO_800NK, TBoxModelProfile.resolve("unknown", crcp))
+        assertEquals(true, TBoxModelProfile.hasValidatedAndroidAutoPreset("unknown", crcp))
+    }
 }

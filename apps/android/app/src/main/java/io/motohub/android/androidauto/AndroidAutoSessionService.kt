@@ -661,13 +661,20 @@ class AndroidAutoSessionService : Service(), AndroidAutoPreviewController {
         if (configuration.source == TBoxVideoAreaSource.LIVE) {
             val negotiatedGeometry = DisplayGeometry(negotiatedArea.width, negotiatedArea.height)
             val liveCapabilities = capabilityStore.load(handle.motorcycle)?.capabilities
+            // Same three inputs prepareReceiver() reads the geometry with, override included.
+            // Without the override this branch answered a different question from the one that
+            // decided whether to USE the geometry, so a rider who pinned Generic could be shown
+            // their measured area being accepted and still find it gone on the next launch.
+            val liveProfileOverride = ProfileOverride.byKey(handle.motorcycle.profileOverrideKey)
             val fallbackPreset = TBoxModelProfile.defaultAndroidAutoPreset(
                 handle.motorcycle.modelId,
-                liveCapabilities
+                liveCapabilities,
+                liveProfileOverride
             )
             val fallbackIsValidated = TBoxModelProfile.hasValidatedAndroidAutoPreset(
                 handle.motorcycle.modelId,
-                liveCapabilities
+                liveCapabilities,
+                liveProfileOverride
             )
             val shouldPersistGeometry = capabilityProfile.source == AndroidAutoCapabilitySource.USER_OVERRIDE ||
                 AndroidAutoCapabilityProfiles.usableSavedGeometryForAuto(
@@ -676,6 +683,35 @@ class AndroidAutoSessionService : Service(), AndroidAutoPreviewController {
                     fallbackIsValidated
                 ) != null
             if (shouldPersistGeometry) {
+                // The case a rider log could not previously explain: the orientation disagrees
+                // with the model profile and the area is saved anyway. The old rule vetoed that
+                // and printed a warning; the new one lets the measurement stand and printed
+                // nothing, so a withdrawn veto and a veto that never applied looked identical
+                // from outside. Rider 6e77dcf7 (2026-09-06) is the log that needed it: his dash
+                // asked for 784x576 landscape against a portrait preset that had won on two
+                // generic touch flags, and every session composited Android Auto into 311x554
+                // of his 784x576 panel.
+                //
+                // Only for the profile-was-a-guess road. A rider's own resolution override and
+                // an exact-fit area are both saved through the same branch for reasons of their
+                // own, and claiming this one would misname them.
+                val negotiatedIsPortrait = negotiatedGeometry.height > negotiatedGeometry.width
+                if (!fallbackIsValidated &&
+                    capabilityProfile.source != AndroidAutoCapabilitySource.USER_OVERRIDE &&
+                    negotiatedIsPortrait != fallbackPreset.isPortrait
+                ) {
+                    ProjectionEventLog.record(
+                        "ANDROID AUTO",
+                        "Saving live T-Box geometry ${negotiatedGeometry.width}x" +
+                            "${negotiatedGeometry.height} even though the " +
+                            "${fallbackPreset.source.width}x${fallbackPreset.source.height} " +
+                            "model profile is the other way round: that profile's orientation is " +
+                            "a guess about this dashboard rather than a fact about it - it was " +
+                            "not named by the modelId, pinned by the rider, or matched without a " +
+                            "rival disputing which way round the panel is - so the area the dash " +
+                            "measured about itself wins."
+                    )
+                }
                 displayGeometryStore.save(handle.motorcycle.ssid, negotiatedGeometry)
                 liveGeometryPersisted = true
             } else {
