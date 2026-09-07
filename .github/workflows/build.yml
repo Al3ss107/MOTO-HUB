@@ -20,15 +20,22 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
+      - name: Install Android SDK components
+        run: |
+          set -euo pipefail
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0"
+
       # FONDAMENTALE: dà i permessi di esecuzione a gradlew
       - name: Permessi di esecuzione per Gradle Wrapper
+        working-directory: apps/android
         run: chmod +x gradlew
 
       - name: Build APK Debug con Gradle
+        working-directory: apps/android
         run: ./gradlew assembleDebug
 
       - name: Carica APK tra gli Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: moto-hub-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: apps/android/app/build/outputs/apk/debug/app-debug.apk
