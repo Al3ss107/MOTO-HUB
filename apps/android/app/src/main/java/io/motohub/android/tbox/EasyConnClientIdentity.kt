@@ -31,7 +31,6 @@ internal object EasyConnClientIdentity {
         "net.easyconn.easyride.wws",
         "net.easyconn.carman",
         "com.carbit.easyconnect"
-        "net.easyconn.easyride.wws"
     )
 
     /** The first candidate, used wherever a probe has not yet settled the question. */
