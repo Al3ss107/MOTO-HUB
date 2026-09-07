@@ -65,6 +65,12 @@ jobs:
         working-directory: apps/android
         run: ./gradlew --no-daemon lintDebug testDebugUnitTest assembleDebug
 
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: apps/android/app/build/outputs/apk/debug/app-debug.apk
+
   ridedaemon:
     name: Locked RideDaemon tests
     runs-on: ubuntu-latest
@@ -108,9 +114,3 @@ jobs:
         run: |
           go test ./...
           go test -race ./...
-          
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: app-debug-apk
-          path: apps/android/app/build/outputs/apk/debug/app-debug.apk
