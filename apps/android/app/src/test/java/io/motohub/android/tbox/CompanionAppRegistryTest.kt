@@ -19,6 +19,7 @@ class CompanionAppRegistryTest {
         assertTrue(packages.contains("com.cfmoto.cfmotointernational"))
         assertTrue(packages.contains("tayo.com.ZontesIntelligence"))
         assertTrue(packages.contains("net.easyconn.carman"))
+        assertTrue(packages.contains("net.easyconn.easyride.wws"))
     }
 
     /**

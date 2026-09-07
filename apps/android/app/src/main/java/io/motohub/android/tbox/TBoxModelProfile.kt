@@ -396,6 +396,7 @@ enum class TBoxModelProfile(
         key = "qj_srk921_rr",
         displayName = "QJ SRK921 RR (test)",
         modelIds = setOf("37303"),
+        packageName = "net.easyconn.easyride.wws"
         mapTilesRequireCellular = true,
         supportsScreenTouch = false,
         defaultAndroidAutoPreset = AndroidAutoVideoPreset.LANDSCAPE_800X480,

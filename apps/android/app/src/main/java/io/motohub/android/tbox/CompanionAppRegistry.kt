@@ -45,6 +45,7 @@ internal object CompanionAppRegistry {
         CompanionApp("tayo.com.ZontesIntelligence", "Zontes Smart"),
         CompanionApp("net.easyconn.carman", "Carbit Ride"),
         CompanionApp("com.carbit.easyconnect", "Carbit EasyConnect")
+        CompanionApp("net.easyconn.easyride.wws", "Carbit Easyride")
     )
 
     /**

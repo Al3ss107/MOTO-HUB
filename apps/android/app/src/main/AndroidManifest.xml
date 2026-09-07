@@ -52,6 +52,7 @@
         <package android:name="tayo.com.ZontesIntelligence" />
         <package android:name="net.easyconn.carman" />
         <package android:name="com.carbit.easyconnect" />
+        <package android:name="net.easyconn.easyride.wws" />
     </queries>
 
     <application
