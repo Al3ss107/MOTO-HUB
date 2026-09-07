@@ -1,37 +1,34 @@
-name: Build APK
+name: Build Android APK (Native)
 
 on:
   push:
-    branches: ["main"]
+    branches: [ "main", "master" ]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
-    defaults:
-      run:
-        working-directory: apps/android/app
-
     steps:
-      - name: Checkout repository
+      - name: Checkout del codice
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: Configura Java JDK
         uses: actions/setup-java@v4
         with:
-          java-version: "17"
-          distribution: "temurin"
-          cache: gradle
+          distribution: 'zulu'
+          java-version: '17'
+          cache: 'gradle'
 
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
+      # FONDAMENTALE: dà i permessi di esecuzione a gradlew
+      - name: Permessi di esecuzione per Gradle Wrapper
+        run: chmod +x gradlew
 
-      - name: Build Debug APK
+      - name: Build APK Debug con Gradle
         run: ./gradlew assembleDebug
 
-      - name: Upload APK artifact
+      - name: Carica APK tra gli Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: moto-hub-debug-apk
-          path: apps/android/app/build/outputs/apk/debug/*.apk
+          path: app/build/outputs/apk/debug/app-debug.apk
