@@ -20,15 +20,27 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
-      # FONDAMENTALE: dà i permessi di esecuzione a gradlew
+      - name: Provision Android Auto identity
+        env:
+          ANDROID_AUTO_CERT_B64: ${{ secrets.ANDROID_AUTO_CERT_B64 }}
+          ANDROID_AUTO_IDENTITY_B64: ${{ secrets.ANDROID_AUTO_IDENTITY_B64 }}
+        run: |
+          set -euo pipefail
+          identity_dir="tooling/private/android-auto"
+          mkdir -p "$identity_dir"
+          printf '%s' "$ANDROID_AUTO_CERT_B64" | base64 --decode > "$identity_dir/aa_cert"
+          printf '%s' "$ANDROID_AUTO_IDENTITY_B64" | base64 --decode > "$identity_dir/aa_identity_data"
+
       - name: Permessi di esecuzione per Gradle Wrapper
+        working-directory: apps/android
         run: chmod +x gradlew
 
       - name: Build APK Debug con Gradle
-        run: ./gradlew assembleDebug
+        working-directory: apps/android
+        run: ./gradlew -PincludeAndroidAutoIdentity=true assembleDebug
 
       - name: Carica APK tra gli Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: moto-hub-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: apps/android/app/build/outputs/apk/debug/app-debug.apk
