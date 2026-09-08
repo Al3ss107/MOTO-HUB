@@ -29,8 +29,17 @@ jobs:
           set -euo pipefail
           identity_dir="tooling/private/android-auto"
           mkdir -p "$identity_dir"
+          if [[ -z "${ANDROID_AUTO_CERT_B64:-}" || -z "${ANDROID_AUTO_IDENTITY_B64:-}" ]]; then
+            echo "::error::Android Auto secrets are missing!"
+            exit 1
+          fi
           printf '%s' "$ANDROID_AUTO_CERT_B64" | base64 --decode > "$identity_dir/aa_cert"
           printf '%s' "$ANDROID_AUTO_IDENTITY_B64" | base64 --decode > "$identity_dir/aa_identity_data"
+          
+          if [[ ! -s "$identity_dir/aa_cert" || ! -s "$identity_dir/aa_identity_data" ]]; then
+            echo "::error::Decoded Android Auto identity files are empty!"
+            exit 1
+          fi
 
       - name: Permessi di esecuzione per Gradle Wrapper
         working-directory: apps/android
