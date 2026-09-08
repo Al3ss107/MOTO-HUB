@@ -1,0 +1,144 @@
+name: Build Android APK - Private AA (No Secrets)
+
+# Build PRIVATA con Android Auto identity MA SENZA GitHub Secrets
+# - NON usa ${{ secrets.* }}
+# - Usa file locali da tooling/private/android-auto/ su self-hosted runner
+# - Produce APK FIRMATO e INSTALLABILE
+
+on:
+  workflow_dispatch:
+    inputs:
+      buildType:
+        description: 'Build type'
+        required: false
+        default: 'release'
+        type: choice
+        options:
+          - debug
+          - release
+
+permissions:
+  contents: read
+
+jobs:
+  build-private:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configura JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          build-root-directory: apps/android
+
+      - name: Install Android SDK 36
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" \
+            "build-tools;36.0.0"
+
+      - name: Verifica hudlib.aar
+        run: |
+          test -f apps/android/app/libs/hudlib.aar || (echo "::error::hudlib.aar mancante" && exit 1)
+          echo "✓ hudlib.aar presente"
+
+      - name: Verifica identità AA locale (senza secrets)
+        run: |
+          set -euo pipefail
+          DIR="tooling/private/android-auto"
+          if [[ ! -f "$DIR/aa_cert" ]]; then
+            echo "::error::Manca $DIR/aa_cert"
+            echo "Guida: metti file in tooling/private/android-auto/"
+            echo "  aa_cert -> PEM certificate"
+            echo "  aa_identity_data -> base64 puro PKCS#8, no header"
+            echo "Self-hosted: copia file manualmente sul runner"
+            echo "Locale consigliato: ./gradlew -PincludeAndroidAutoIdentity=true assembleRelease"
+            exit 1
+          fi
+          if [[ ! -f "$DIR/aa_identity_data" ]]; then echo "::error::Manca aa_identity_data"; exit 1; fi
+          if grep -q "BEGIN" "$DIR/aa_identity_data"; then
+            echo "::error::aa_identity_data ha header PEM, deve essere base64 puro"
+            exit 1
+          fi
+          echo "✓ aa_cert $(wc -c < "$DIR/aa_cert") bytes"
+          echo "✓ aa_identity_data $(wc -c < "$DIR/aa_identity_data") bytes"
+          # Check match cert/key
+          openssl x509 -in "$DIR/aa_cert" -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum > /tmp/c.hash
+          base64 -d "$DIR/aa_identity_data" | openssl pkey -inform DER -pubout -outform DER | sha256sum > /tmp/k.hash
+          if cmp /tmp/c.hash /tmp/k.hash; then echo "✓ Cert e key matchano"; else echo "::error::Cert e key non matchano"; cat /tmp/c.hash /tmp/k.hash; exit 1; fi
+
+      - name: Permessi gradlew
+        working-directory: apps/android
+        run: chmod +x gradlew
+
+      - name: Build Debug con AA
+        if: ${{ inputs.buildType == 'debug' }}
+        working-directory: apps/android
+        run: ./gradlew --no-daemon -PincludeAndroidAutoIdentity=true assembleDebug
+
+      - name: Build Release con AA (unsigned)
+        if: ${{ inputs.buildType == 'release' }}
+        working-directory: apps/android
+        run: ./gradlew --no-daemon -PincludeAndroidAutoIdentity=true assembleRelease
+
+      - name: Firma Release con debug keystore (rende installabile)
+        if: ${{ inputs.buildType == 'release' }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          UNSIGNED="apps/android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          ALIGNED="apps/android/app/build/outputs/apk/release/app-release-aligned.apk"
+          SIGNED="apps/android/app/build/outputs/apk/release/app-release-signed-aa.apk"
+          DEBUG_KS="$HOME/.android/debug.keystore"
+          if [[ ! -f "$UNSIGNED" ]]; then echo "::error::Unsigned non trovato"; exit 1; fi
+          if [[ ! -f "$DEBUG_KS" ]]; then
+            mkdir -p "$HOME/.android"
+            keytool -genkeypair -keystore "$DEBUG_KS" -alias AndroidDebugKey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          "$BT/zipalign" -p -f 4 "$UNSIGNED" "$ALIGNED"
+          "$BT/apksigner" sign --ks "$DEBUG_KS" --ks-key-alias AndroidDebugKey --ks-pass pass:android --key-pass pass:android --out "$SIGNED" "$ALIGNED"
+          "$BT/apksigner" verify --verbose "$SIGNED"
+          ls -lh "$SIGNED"
+
+      - name: Verifica APK contiene AA
+        run: |
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          for apk in apps/android/app/build/outputs/apk/debug/*.apk apps/android/app/build/outputs/apk/release/*.apk; do
+            [[ -f "$apk" ]] || continue
+            echo "Check $apk"
+            if "$BT/aapt" dump resources "$apk" | grep -q "raw/aa_cert"; then echo "✓ $apk contiene AA"; else echo "::error::$apk senza AA"; exit 1; fi
+            "$BT/apksigner" verify --verbose "$apk" || echo "::warning::APK non firmato: $apk"
+          done
+
+      - name: Upload Debug AA (installabile, debug keystore)
+        if: ${{ inputs.buildType == 'debug' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: moto-hub-debug-aa-installabile
+          path: apps/android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 7
+
+      - name: Upload Release AA firmato (installabile)
+        if: ${{ inputs.buildType == 'release' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: moto-hub-release-aa-installabile
+          path: |
+            apps/android/app/build/outputs/apk/release/app-release-signed-aa.apk
+            apps/android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf tooling/private/android-auto/ /tmp/c.hash /tmp/k.hash

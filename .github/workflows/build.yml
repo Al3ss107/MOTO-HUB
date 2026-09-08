@@ -5,52 +5,187 @@ on:
     branches: [ "main", "master" ]
   pull_request:
   workflow_dispatch:
+    inputs:
+      buildType:
+        description: 'Build type'
+        required: false
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+          - both
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 35
 
     steps:
       - name: Checkout del codice
         uses: actions/checkout@v4
 
-      - name: Configura Java JDK
+      - name: Configura Java JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: 'zulu'
+          distribution: 'temurin'
           java-version: '17'
           cache: 'gradle'
 
-      - name: Provision Android Auto identity
-        env:
-          ANDROID_AUTO_CERT_B64: ${{ secrets.ANDROID_AUTO_CERT_B64 }}
-          ANDROID_AUTO_IDENTITY_B64: ${{ secrets.ANDROID_AUTO_IDENTITY_B64 }}
+      - name: Setup Gradle (cache)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          build-root-directory: apps/android
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+        continue-on-error: true
+
+      - name: Install Android SDK 36
         run: |
           set -euo pipefail
-          identity_dir="tooling/private/android-auto"
-          mkdir -p "$identity_dir"
-          if [[ -z "${ANDROID_AUTO_CERT_B64:-}" || -z "${ANDROID_AUTO_IDENTITY_B64:-}" ]]; then
-            echo "::error::Android Auto secrets are missing!"
-            exit 1
-          fi
-          printf '%s' "$ANDROID_AUTO_CERT_B64" | base64 --decode > "$identity_dir/aa_cert"
-          printf '%s' "$ANDROID_AUTO_IDENTITY_B64" | base64 --decode > "$identity_dir/aa_identity_data"
-          
-          if [[ ! -s "$identity_dir/aa_cert" || ! -s "$identity_dir/aa_identity_data" ]]; then
-            echo "::error::Decoded Android Auto identity files are empty!"
-            exit 1
-          fi
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" \
+            "build-tools;36.0.0"
 
-      - name: Permessi di esecuzione per Gradle Wrapper
+      - name: Verifica hudlib.aar
+        run: |
+          set -euo pipefail
+          AAR="apps/android/app/libs/hudlib.aar"
+          if [[ ! -f "$AAR" ]]; then
+            echo "::error:: $AAR mancante! Vedi README Building"
+            exit 1
+          fi
+          echo "✓ hudlib.aar: $(du -h "$AAR" | cut -f1)"
+
+      - name: Pulisci eventuale identità AA (build pubblica deve essere senza)
+        run: |
+          rm -rf tooling/private/android-auto/
+          echo "✓ Build pubblica CORE senza identità AA"
+
+      - name: Permessi Gradle Wrapper
         working-directory: apps/android
         run: chmod +x gradlew
 
-      - name: Build APK Debug con Gradle
+      # ==================== DEBUG (FIRMATO, INSTALLABILE) ====================
+      # assembleDebug è firmato automaticamente con debug keystore -> INSTALLABILE
+      - name: Build APK Debug (firmato, installabile)
+        if: ${{ inputs.buildType == 'debug' || inputs.buildType == 'both' || inputs.buildType == '' }}
         working-directory: apps/android
-        run: ./gradlew -PincludeAndroidAutoIdentity=true assembleDebug
+        run: |
+          set -euo pipefail
+          echo "=== Building CORE Debug - FIRMATO con debug keystore ==="
+          ./gradlew --no-daemon --stacktrace assembleDebug
+          ls -lh app/build/outputs/apk/debug/
 
-      - name: Carica APK tra gli Artifacts
+      - name: Verifica APK Debug firmato
+        if: ${{ inputs.buildType == 'debug' || inputs.buildType == 'both' || inputs.buildType == '' }}
+        run: |
+          set -euo pipefail
+          APK="apps/android/app/build/outputs/apk/debug/app-debug.apk"
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/36.0.0"
+          if [[ ! -f "$APK" ]]; then echo "::error::APK Debug non trovato"; exit 1; fi
+          echo "Verifico firma..."
+          "$BUILD_TOOLS/apksigner" verify --verbose "$APK"
+          echo "Verifico NON contenga aa_cert (build pubblica)..."
+          if "$BUILD_TOOLS/aapt" dump resources "$APK" 2>/dev/null | grep -q "raw/aa_cert"; then
+            echo "::error::APK pubblico contiene aa_cert!"
+            exit 1
+          fi
+          echo "✓ APK Debug firmato e installabile"
+
+      # ==================== RELEASE (ORA FIRMATO CON DEBUG KEYSTORE) ====================
+      # Prima era unsigned -> Android rifiutava installazione
+      # Ora lo firmiamo con debug keystore per renderlo installabile per test
+      - name: Build APK Release (unsigned -> poi firmato)
+        if: ${{ inputs.buildType == 'release' || inputs.buildType == 'both' }}
+        working-directory: apps/android
+        run: |
+          set -euo pipefail
+          echo "=== Building CORE Release ==="
+          ./gradlew --no-daemon --stacktrace assembleRelease
+          ls -lh app/build/outputs/apk/release/
+
+      - name: Firma Release APK con debug keystore (rende installabile)
+        if: ${{ inputs.buildType == 'release' || inputs.buildType == 'both' }}
+        run: |
+          set -euo pipefail
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/36.0.0"
+          UNSIGNED="apps/android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          ALIGNED="apps/android/app/build/outputs/apk/release/app-release-aligned.apk"
+          SIGNED="apps/android/app/build/outputs/apk/release/app-release-signed.apk"
+          SIGNED_DEBUG="apps/android/app/build/outputs/apk/release/MOTO-HUB-CORE-debug-signed.apk"
+          DEBUG_KEYSTORE="$HOME/.android/debug.keystore"
+
+          if [[ ! -f "$UNSIGNED" ]]; then
+            echo "::error::Unsigned APK non trovato: $UNSIGNED"
+            exit 1
+          fi
+
+          if [[ ! -f "$DEBUG_KEYSTORE" ]]; then
+            echo "Genero debug keystore..."
+            mkdir -p "$HOME/.android"
+            keytool -genkeypair \
+              -keystore "$DEBUG_KEYSTORE" \
+              -alias AndroidDebugKey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass android -keypass android \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+          echo "=== zipalign ==="
+          "$BUILD_TOOLS/zipalign" -p -f 4 "$UNSIGNED" "$ALIGNED"
+
+          echo "=== apksigner sign con debug keystore ==="
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks "$DEBUG_KEYSTORE" \
+            --ks-key-alias AndroidDebugKey \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --out "$SIGNED" \
+            "$ALIGNED"
+
+          cp "$SIGNED" "$SIGNED_DEBUG"
+
+          echo "=== Verifica firma ==="
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$SIGNED"
+          "$BUILD_TOOLS/zipalign" -c -v 4 "$SIGNED"
+
+          echo "=== Verifica contenuto (no aa_cert) ==="
+          if "$BUILD_TOOLS/aapt" dump resources "$SIGNED" | grep -q "raw/aa_cert"; then
+            echo "::error::APK release contiene aa_cert!"
+            exit 1
+          fi
+
+          ls -lh "$SIGNED" "$SIGNED_DEBUG"
+          echo "✓ APK Release firmato e INSTALLABILE"
+
+      - name: Lista finale APK
+        if: always()
+        run: |
+          find apps/android/app/build/outputs/apk -type f -name "*.apk" -exec ls -lh {} \;
+
+      - name: Carica APK Debug (INSTALLABILE)
+        if: ${{ always() && (inputs.buildType == 'debug' || inputs.buildType == 'both' || inputs.buildType == '') }}
         uses: actions/upload-artifact@v4
         with:
-          name: moto-hub-debug-apk
+          name: moto-hub-debug-apk-installabile
           path: apps/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Carica APK Release firmato con debug keystore (INSTALLABILE)
+        if: ${{ always() && (inputs.buildType == 'release' || inputs.buildType == 'both') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: moto-hub-release-firmato-installabile
+          path: |
+            apps/android/app/build/outputs/apk/release/app-release-signed.apk
+            apps/android/app/build/outputs/apk/release/MOTO-HUB-CORE-debug-signed.apk
+          if-no-files-found: error
+          retention-days: 14
