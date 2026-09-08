@@ -1,12 +1,9 @@
 name: Build Android APK - Private AA (No Secrets)
 
-# Questa workflow è per build PRIVATE con Android Auto identity
-# MA SENZA usare GitHub Secrets.
-# Come funziona:
+# Build PRIVATA con Android Auto identity MA SENZA GitHub Secrets
 # - NON usa ${{ secrets.* }}
-# - Si aspetta che i file siano già presenti sul runner
-# - Ideale per self-hosted runner dove hai messo manualmente i file
-# - Oppure per build locali (guida ufficiale consiglia build locale, non CI)
+# - Usa file locali da tooling/private/android-auto/ su self-hosted runner
+# - Produce APK FIRMATO e INSTALLABILE
 
 on:
   workflow_dispatch:
@@ -25,9 +22,6 @@ permissions:
 
 jobs:
   build-private:
-    # Per build privata con chiavi, usa self-hosted runner
-    # dove hai manualmente creato tooling/private/android-auto/
-    # Se vuoi testare su ubuntu-latest, devi prima mettere i file a mano sul runner (non committarli!)
     runs-on: ubuntu-latest
     timeout-minutes: 35
 
@@ -58,132 +52,93 @@ jobs:
           test -f apps/android/app/libs/hudlib.aar || (echo "::error::hudlib.aar mancante" && exit 1)
           echo "✓ hudlib.aar presente"
 
-      - name: Verifica identità Android Auto locale (senza secrets)
-        id: check-identity
+      - name: Verifica identità AA locale (senza secrets)
         run: |
           set -euo pipefail
-          IDENTITY_DIR="tooling/private/android-auto"
-          echo "Controllo $IDENTITY_DIR/aa_cert e aa_identity_data..."
-          
-          if [[ ! -f "$IDENTITY_DIR/aa_cert" ]]; then
-            echo "::error::File mancante: $IDENTITY_DIR/aa_cert"
-            echo ""
-            echo "GUIDA UFFICIALE - Put the files here (create folder, it's gitignored):"
-            echo "  tooling/private/android-auto/aa_cert"
-            echo "  tooling/private/android-auto/aa_identity_data"
-            echo ""
-            echo "Formati:"
-            echo "  - aa_cert -> X.509 PEM (-----BEGIN CERTIFICATE-----)"
-            echo "  - aa_identity_data -> PKCS#8 private key as plain base64, NO header"
-            echo "    Converti da PEM: openssl pkcs8 -topk8 -nocrypt -in aa_privkey -out pk8.pem && grep -v -- '-----' pk8.pem | tr -d '\n' > tooling/private/android-auto/aa_identity_data"
-            echo ""
-            echo "Per CI senza GitHub Secrets hai 2 opzioni:"
-            echo "1. Self-hosted runner: metti i file manualmente sul runner in tooling/private/android-auto/"
-            echo "2. Build locale (consigliato da guida): ./gradlew -PincludeAndroidAutoIdentity=true assembleRelease"
-            echo ""
-            echo "Questa build è volutamente SENZA secrets per rispettare la tua richiesta di rimuoverli da GitHub."
+          DIR="tooling/private/android-auto"
+          if [[ ! -f "$DIR/aa_cert" ]]; then
+            echo "::error::Manca $DIR/aa_cert"
+            echo "Guida: metti file in tooling/private/android-auto/"
+            echo "  aa_cert -> PEM certificate"
+            echo "  aa_identity_data -> base64 puro PKCS#8, no header"
+            echo "Self-hosted: copia file manualmente sul runner"
+            echo "Locale consigliato: ./gradlew -PincludeAndroidAutoIdentity=true assembleRelease"
             exit 1
           fi
-
-          if [[ ! -f "$IDENTITY_DIR/aa_identity_data" ]]; then
-            echo "::error::File mancante: $IDENTITY_DIR/aa_identity_data"
+          if [[ ! -f "$DIR/aa_identity_data" ]]; then echo "::error::Manca aa_identity_data"; exit 1; fi
+          if grep -q "BEGIN" "$DIR/aa_identity_data"; then
+            echo "::error::aa_identity_data ha header PEM, deve essere base64 puro"
             exit 1
           fi
-
-          echo "✓ aa_cert presente: $(wc -c < "$IDENTITY_DIR/aa_cert") bytes"
-          echo "✓ aa_identity_data presente: $(wc -c < "$IDENTITY_DIR/aa_identity_data") bytes"
-
-          # Sanity check formati
-          if grep -q "BEGIN" "$IDENTITY_DIR/aa_identity_data"; then
-            echo "::error::aa_identity_data contiene header PEM! Deve essere base64 puro senza -----BEGIN/END-----"
-            echo "Converti: openssl pkcs8 -topk8 -nocrypt -in aa_privkey -out pk8.pem && grep -v -- '-----' pk8.pem | tr -d '\n' > tooling/private/android-auto/aa_identity_data"
-            exit 1
-          fi
-
-          if ! grep -q "BEGIN CERTIFICATE" "$IDENTITY_DIR/aa_cert"; then
-            echo "::warning::aa_cert non sembra PEM certificate, verifica formato"
-          fi
-
-          # Verifica che cert e key matchino (se openssl disponibile)
-          echo "Verifica match cert/key..."
-          set +e
-          openssl x509 -in "$IDENTITY_DIR/aa_cert" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum > /tmp/cert.hash
-          base64 -d "$IDENTITY_DIR/aa_identity_data" 2>/dev/null | openssl pkey -inform DER -pubout -outform DER 2>/dev/null | sha256sum > /tmp/key.hash
-          if [[ -s /tmp/cert.hash && -s /tmp/key.hash ]]; then
-            if cmp /tmp/cert.hash /tmp/key.hash; then
-              echo "✓ Cert e key matchano (stesso hash)"
-            else
-              echo "::error::Cert e key NON matchano! L'handshake AA fallirà"
-              echo "Cert hash: $(cat /tmp/cert.hash)"
-              echo "Key hash: $(cat /tmp/key.hash)"
-              exit 1
-            fi
-          else
-            echo "::warning::Impossibile verificare match cert/key (openssl fallito), continuo..."
-          fi
-          set -e
-
-          echo "has_identity=true" >> "$GITHUB_OUTPUT"
+          echo "✓ aa_cert $(wc -c < "$DIR/aa_cert") bytes"
+          echo "✓ aa_identity_data $(wc -c < "$DIR/aa_identity_data") bytes"
+          # Check match cert/key
+          openssl x509 -in "$DIR/aa_cert" -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum > /tmp/c.hash
+          base64 -d "$DIR/aa_identity_data" | openssl pkey -inform DER -pubout -outform DER | sha256sum > /tmp/k.hash
+          if cmp /tmp/c.hash /tmp/k.hash; then echo "✓ Cert e key matchano"; else echo "::error::Cert e key non matchano"; cat /tmp/c.hash /tmp/k.hash; exit 1; fi
 
       - name: Permessi gradlew
         working-directory: apps/android
         run: chmod +x gradlew
 
-      - name: Build Debug con AA Identity (privata, no secrets)
+      - name: Build Debug con AA
         if: ${{ inputs.buildType == 'debug' }}
         working-directory: apps/android
-        run: |
-          echo "Build PRIVATE con -PincludeAndroidAutoIdentity=true"
-          echo "Usa file locali da tooling/private/android-auto/ - NO GitHub Secrets"
-          ./gradlew --no-daemon -PincludeAndroidAutoIdentity=true assembleDebug
+        run: ./gradlew --no-daemon -PincludeAndroidAutoIdentity=true assembleDebug
 
-      - name: Build Release con AA Identity (privata, no secrets)
+      - name: Build Release con AA (unsigned)
         if: ${{ inputs.buildType == 'release' }}
         working-directory: apps/android
-        run: |
-          echo "Build PRIVATE Release con -PincludeAndroidAutoIdentity=true"
-          ./gradlew --no-daemon -PincludeAndroidAutoIdentity=true assembleRelease
+        run: ./gradlew --no-daemon -PincludeAndroidAutoIdentity=true assembleRelease
 
-      - name: Verifica APK contiene identità AA
+      - name: Firma Release con debug keystore (rende installabile)
+        if: ${{ inputs.buildType == 'release' }}
         run: |
           set -euo pipefail
-          APK_DEBUG="apps/android/app/build/outputs/apk/debug/app-debug.apk"
-          APK_RELEASE="apps/android/app/build/outputs/apk/release/app-release.apk"
-          APK_RELEASE_UNSIGNED="apps/android/app/build/outputs/apk/release/app-release-unsigned.apk"
-          
-          for apk in "$APK_DEBUG" "$APK_RELEASE" "$APK_RELEASE_UNSIGNED"; do
-            if [[ -f "$apk" ]]; then
-              echo "Verifico $apk contiene aa_cert..."
-              if "$ANDROID_HOME/build-tools/36.0.0/aapt" dump resources "$apk" | grep -q "raw/aa_cert"; then
-                echo "✓ $apk contiene aa_cert e aa_identity_data - build privata OK"
-              else
-                echo "::error::$apk NON contiene aa_cert! Flag -PincludeAndroidAutoIdentity=true non ha funzionato"
-                exit 1
-              fi
-            fi
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          UNSIGNED="apps/android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          ALIGNED="apps/android/app/build/outputs/apk/release/app-release-aligned.apk"
+          SIGNED="apps/android/app/build/outputs/apk/release/app-release-signed-aa.apk"
+          DEBUG_KS="$HOME/.android/debug.keystore"
+          if [[ ! -f "$UNSIGNED" ]]; then echo "::error::Unsigned non trovato"; exit 1; fi
+          if [[ ! -f "$DEBUG_KS" ]]; then
+            mkdir -p "$HOME/.android"
+            keytool -genkeypair -keystore "$DEBUG_KS" -alias AndroidDebugKey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          "$BT/zipalign" -p -f 4 "$UNSIGNED" "$ALIGNED"
+          "$BT/apksigner" sign --ks "$DEBUG_KS" --ks-key-alias AndroidDebugKey --ks-pass pass:android --key-pass pass:android --out "$SIGNED" "$ALIGNED"
+          "$BT/apksigner" verify --verbose "$SIGNED"
+          ls -lh "$SIGNED"
+
+      - name: Verifica APK contiene AA
+        run: |
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          for apk in apps/android/app/build/outputs/apk/debug/*.apk apps/android/app/build/outputs/apk/release/*.apk; do
+            [[ -f "$apk" ]] || continue
+            echo "Check $apk"
+            if "$BT/aapt" dump resources "$apk" | grep -q "raw/aa_cert"; then echo "✓ $apk contiene AA"; else echo "::error::$apk senza AA"; exit 1; fi
+            "$BT/apksigner" verify --verbose "$apk" || echo "::warning::APK non firmato: $apk"
           done
 
-      - name: Upload APK Debug AA
+      - name: Upload Debug AA (installabile, debug keystore)
         if: ${{ inputs.buildType == 'debug' }}
         uses: actions/upload-artifact@v4
         with:
-          name: moto-hub-debug-aa-private
+          name: moto-hub-debug-aa-installabile
           path: apps/android/app/build/outputs/apk/debug/app-debug.apk
-          retention-days: 3
+          retention-days: 7
 
-      - name: Upload APK Release AA
+      - name: Upload Release AA firmato (installabile)
         if: ${{ inputs.buildType == 'release' }}
         uses: actions/upload-artifact@v4
         with:
-          name: moto-hub-release-aa-private
+          name: moto-hub-release-aa-installabile
           path: |
+            apps/android/app/build/outputs/apk/release/app-release-signed-aa.apk
             apps/android/app/build/outputs/apk/release/app-release.apk
-            apps/android/app/build/outputs/apk/release/app-release-unsigned.apk
-          retention-days: 3
+          if-no-files-found: error
+          retention-days: 7
 
-      - name: Cleanup identità (security)
+      - name: Cleanup
         if: always()
-        run: |
-          echo "Rimuovo identità dal runner per sicurezza..."
-          rm -rf tooling/private/android-auto/
-          rm -f /tmp/cert.hash /tmp/key.hash
+        run: rm -rf tooling/private/android-auto/ /tmp/c.hash /tmp/k.hash
