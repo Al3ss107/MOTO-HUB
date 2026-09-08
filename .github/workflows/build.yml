@@ -3,6 +3,7 @@ name: Build Android APK (Native)
 on:
   push:
     branches: [ "main", "master" ]
+  pull_request:
   workflow_dispatch:
 
 jobs:
